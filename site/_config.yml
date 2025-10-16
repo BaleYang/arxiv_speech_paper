@@ -1,0 +1,6 @@
+title: "Daily arXiv Summaries (cs.SD / eess.AS)"
+description: "Auto-updated daily by GitHub Actions"
+theme: minima
+plugins:
+  - jekyll-feed
+
