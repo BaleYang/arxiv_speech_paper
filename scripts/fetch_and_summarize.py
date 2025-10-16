@@ -270,6 +270,8 @@ def write_daily_post(date_str: str, items: list, total_entries: int, window_star
     print(f"Wrote {out_path}")
     return out_path
 
+
+
 def cleanup_pdfs_folder():
     try:
         if os.path.isdir(PDF_DIR):
