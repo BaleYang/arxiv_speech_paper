@@ -16,15 +16,13 @@ TIME_WINDOW_HOURS = int(os.environ.get("TIME_WINDOW_HOURS", "24"))  # 最近多�
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")   # 可换成你账户可用、性价比高的模型
 OUT_DIR = "site/_posts"
 DB_PATH = "data/seen_ids.json"
-RESET_SEEN = os.environ.get("RESET_SEEN", "0").lower() in ("1", "true", "yes")
+RESET_SEEN = os.environ.get("RESET_SEEN", "1").lower() in ("1", "true", "yes")
 DEBUG_LIST_CATEGORIES = os.environ.get("DEBUG_LIST_CATEGORIES", "0").lower() in ("1", "true", "yes")
 DRY_RUN = os.environ.get("DRY_RUN", "0").lower() in ("1", "true", "yes")
 # 仅主分类过滤（默认开启，确保主分类为 cs.SD 或 eess.AS）
 STRICT_PRIMARY_ONLY = 0
 # 关键词包含（可选）：逗号分隔；命中任意一个（标题/摘要）才保留
-KEYWORDS_INCLUDE = [
-    kw.strip().lower() for kw in os.environ.get("KEYWORDS_INCLUDE", "").split(",") if kw.strip()
-]
+KEYWORDS_INCLUDE = 0
 
 # arXiv API：按提交时间倒序
 def build_arxiv_query(categories: str) -> str:

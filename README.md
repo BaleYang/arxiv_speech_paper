@@ -49,7 +49,7 @@ python scripts/fetch_and_summarize.py
 ```
 git add -A
 git commit -m "update"
-git push origin main
+git push --force-with-lease origin main
 ```
 
 
