@@ -24,6 +24,8 @@ STRICT_PRIMARY_ONLY = 0
 # 关键词包含（可选）：逗号分隔；命中任意一个（标题/摘要）才保留
 KEYWORDS_INCLUDE = 0
 
+
+
 # arXiv API：按提交时间倒序
 def build_arxiv_query(categories: str) -> str:
     cats = [c.strip() for c in categories.split(",") if c.strip()]
