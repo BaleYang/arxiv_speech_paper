@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparser
 import feedparser
 from urllib.parse import urlencode, quote_plus
+from zoneinfo import ZoneInfo
 
 # OpenAI SDK (>=1.0)
 from openai import OpenAI
@@ -55,24 +56,40 @@ def arxiv_id_from_link(link: str) -> str:
     m = re.search(r'arxiv\.org/abs/([^/]+)$', link)
     return m.group(1) if m else link
 
+def compute_anchored_window():
+    """返回以北京时间 08:50 为锚点的 24 小时窗口（昨日 08:50 → 今日 08:50）。
+    end 锚点取“最近一次不超过当前时间的 08:50”。"""
+    tz_cst = ZoneInfo("Asia/Shanghai")
+    now_cst = datetime.now(tz_cst)
+    anchor_today = now_cst.replace(hour=8, minute=50, second=0, microsecond=0)
+    if now_cst >= anchor_today:
+        end_cst = anchor_today
+    else:
+        end_cst = anchor_today - timedelta(days=1)
+    start_cst = end_cst - timedelta(days=1)
+    start_utc = start_cst.astimezone(timezone.utc)
+    end_utc = end_cst.astimezone(timezone.utc)
+    return start_utc, end_utc, start_cst, end_cst
+
 def fetch_recent_entries():
     url = build_arxiv_query(CATEGORIES)
     feed = feedparser.parse(url)
     if feed.bozo:
         raise RuntimeError(f"Feed parse error: {feed.bozo_exception}")
-    now_utc = datetime.now(timezone.utc)
-    window_start = now_utc - timedelta(hours=TIME_WINDOW_HOURS)
+    window_start_utc, window_end_utc, window_start_cst, window_end_cst = compute_anchored_window()
     entries = []
     for e in feed.entries:
-        updated_raw = getattr(e, "updated", getattr(e, "published", ""))
-        if not updated_raw:
+        # 优先基于 published 过滤；缺失时退回 updated
+        ts_raw = getattr(e, "published", getattr(e, "updated", ""))
+        if not ts_raw:
             continue
-        updated = dtparser.parse(updated_raw)
-        if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
-        if updated >= window_start:
+        ts = dtparser.parse(ts_raw)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        # 使用 [start, end) 半开区间，避免与隔天窗口重叠
+        if window_start_utc <= ts < window_end_utc:
             entries.append(e)
-    return entries
+    return entries, window_start_cst, window_end_cst
 
 def extract_categories(e) -> list:
     cats = []
@@ -130,7 +147,7 @@ def translate_abstract_to_zh(title, authors, summary, categories, link, pdf_link
 def ensure_posts_dir() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
-def write_daily_post(date_str: str, items: list, total_entries: int) -> str:
+def write_daily_post(date_str: str, items: list, total_entries: int, window_start_cst: datetime, window_end_cst: datetime) -> str:
     """
     生成 Jekyll 博文：
     文件名形如：YYYY-MM-DD-arxiv.md
@@ -143,8 +160,8 @@ def write_daily_post(date_str: str, items: list, total_entries: int) -> str:
     lines.append(f'title: "arXiv Daily – {date_str}"')
     lines.append("tags: [arxiv, cs.SD, eess.AS]")
     lines.append("---\n")
-    lines.append(f"以下为 {date_str}（UTC±）窗口内更新的论文中文译文：")
-    lines.append(f"- 时间窗口：最近 {TIME_WINDOW_HOURS} 小时")
+    lines.append(f"以下为 {date_str}（CST，北京时间）窗口内更新的论文中文译文：")
+    lines.append(f"- 时间窗口（锚点 08:50 CST）：{window_start_cst.strftime('%Y-%m-%d %H:%M')} — {window_end_cst.strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"- 抓取总数：{total_entries} 篇 | 本页显示：{len(items)} 篇（去重/过滤后）\n")
 
     for it in items:
@@ -164,7 +181,7 @@ def write_daily_post(date_str: str, items: list, total_entries: int) -> str:
 
 def main() -> None:
     seen = set() if RESET_SEEN else load_seen_ids()
-    entries = fetch_recent_entries()
+    entries, window_start_cst, window_end_cst = fetch_recent_entries()
     total_entries_count = len(entries)
     # 允许的分类集合（与查询参数一致）
     allowed = {c.strip() for c in CATEGORIES.split(",") if c.strip()}
@@ -174,6 +191,7 @@ def main() -> None:
 
     # 仅打印分类调试信息后退出
     if DEBUG_LIST_CATEGORIES:
+        print(f"Window CST: {window_start_cst.strftime('%Y-%m-%d %H:%M')} — {window_end_cst.strftime('%Y-%m-%d %H:%M')}")
         print(f"Fetched entries: {len(entries)} | Allowed: {sorted(list(allowed))} | STRICT_PRIMARY_ONLY={STRICT_PRIMARY_ONLY} | KEYWORDS_INCLUDE={KEYWORDS_INCLUDE}")
         kept = 0
         for e in entries:
@@ -258,8 +276,9 @@ def main() -> None:
     save_seen_ids(seen)
 
     if items:
-        today = datetime.now(timezone.utc).date().isoformat()
-        write_daily_post(today, items, total_entries_count)
+        # 以窗口结束日（CST）命名当日文件
+        date_str = window_end_cst.date().isoformat()
+        write_daily_post(date_str, items, total_entries_count, window_start_cst, window_end_cst)
     else:
         print("No new items to write.")
 
