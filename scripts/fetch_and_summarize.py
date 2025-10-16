@@ -17,7 +17,7 @@ client_provider = None
 
 # 环境变量参数（可在 GitHub Actions 中覆写）
 CATEGORIES = os.environ.get("ARXIV_CATEGORIES", "cs.SD,eess.AS")
-MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "20"))     # 每天最多翻译多少篇，防止token开销过大
+MAX_PAPERS = int(os.environ.get("MAX_PAPERS", "20"))     # 每天最多翻译多少篇，防止token开销过大 11
 TIME_WINDOW_HOURS = int(os.environ.get("TIME_WINDOW_HOURS", "24"))  # 最近多少小时内更新的论文
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")   # 可换成你账户可用、性价比高的模型
 OUT_DIR = "site/_posts"
