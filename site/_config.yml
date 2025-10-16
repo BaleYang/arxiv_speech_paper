@@ -3,4 +3,6 @@ description: "Auto-updated daily by GitHub Actions"
 theme: minima
 plugins:
   - jekyll-feed
+header_pages:
+  - previous.md
 
