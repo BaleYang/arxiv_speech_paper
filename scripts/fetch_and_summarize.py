@@ -151,7 +151,8 @@ def write_daily_post(date_str: str, items: list, total_entries: int) -> str:
         lines.append(f"## {it['title']}")
         lines.append(f"- **Authors**: {', '.join(it['authors'])}")
         lines.append(f"- **Categories**: {', '.join(it['categories'])}")
-        lines.append(f"- **arXiv**: [{it['link']}]({it['link']})  |  **PDF**: [{it['pdf']}]({it['pdf']})")
+        lines.append(f"- **arXiv**: [{it['link']}]({it['link']})")
+        lines.append(f"- **PDF**: [{it['pdf']}]({it['pdf']})")
         lines.append("")
         lines.append(it["summary_md"])  # 中文译文/要点
         lines.append("\n---\n")
