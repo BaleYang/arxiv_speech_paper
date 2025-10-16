@@ -4,11 +4,16 @@ from dateutil import parser as dtparser
 import feedparser
 from urllib.parse import urlencode, quote_plus
 from zoneinfo import ZoneInfo
+import requests
+import shutil
+
+import fitz  # pip install pymupdf
 
 # OpenAI SDK (>=1.0)
 from openai import OpenAI
-# 延迟初始化，避免调试模式需要 OPENAI_API_KEY
+# 延迟初始化，避免调试模式需要 API Key
 client = None
+client_provider = None
 
 # 环境变量参数（可在 GitHub Actions 中覆写）
 CATEGORIES = os.environ.get("ARXIV_CATEGORIES", "cs.SD,eess.AS")
@@ -25,6 +30,31 @@ STRICT_PRIMARY_ONLY = 0
 # 关键词包含（可选）：逗号分隔；命中任意一个（标题/摘要）才保留
 KEYWORDS_INCLUDE = 0
 
+# PDF 解析与全文解读设置
+PDF_DIR = os.environ.get("PDF_DIR", "data/pdfs")
+ANALYSIS_MAX_CHARS = int(os.environ.get("ANALYSIS_MAX_CHARS", "100000"))
+ANALYSIS_MODEL = os.environ.get("ANALYSIS_MODEL", "")  # 为空则回落到 MODEL 或 deepseek 默认
+
+# LLM 提供方（openai / deepseek），deepseek 使用 OpenAI 兼容 API
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek").lower()
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/beta")
+
+
+def extract_text_pymupdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    texts = []
+    for page in doc:
+        # "text"最干净；"blocks"保留块结构；"raw"更接近原始顺序；"xhtml"含标记
+        texts.append(page.get_text("text"))
+    full_text = "\n".join(texts)
+    # 查找最后一次出现的 "references"（不区分大小写），并丢弃其后的内容（包含匹配本身）
+    last_index = -1
+    for match in re.finditer(r'(?i)\breferences\b', full_text):
+        last_index = match.start()
+    if last_index != -1:
+        return full_text[:last_index].rstrip()
+    return full_text
 
 
 # arXiv API：按提交时间倒序
@@ -113,12 +143,28 @@ def get_primary_category(e) -> str:
         return apc.get("term") if isinstance(apc, dict) else getattr(apc, "term", None)
     return None
 
-def translate_abstract_to_zh(title, authors, summary, categories, link, pdf_link) -> str:
-    # 仅进行中文翻译与简要结构化整理，不需要读取 PDF
-    global client
-    if client is None:
+def normalize_whitespace(text: str) -> str:
+    if not text:
+        return ""
+    # 把所有空白（含换行、制表）折叠为单个空格
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+def ensure_client():
+    global client, client_provider
+    if client is not None:
+        return
+    if LLM_PROVIDER == "deepseek":
+        # OpenAI 兼容客户端（base_url+api_key）
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        client_provider = "deepseek"
+    else:
         api_key = os.environ.get("OPENAI_API_KEY", "")
         client = OpenAI(api_key=api_key)
+        client_provider = "openai"
+
+def translate_abstract_to_zh(title, authors, summary, categories, link, pdf_link) -> str:
+    # 仅进行中文翻译与简要结构化整理，不需要读取 PDF
+    ensure_client()
     sys = "你是资深学术翻译助理。请把英文摘要翻译成高质量中文."
     user = f"""
 请将以下 arXiv 论文的英文摘要翻译成高质量中文：
@@ -134,8 +180,42 @@ def translate_abstract_to_zh(title, authors, summary, categories, link, pdf_link
 【英文摘要】
 {summary}
 """
+    model_name = MODEL if LLM_PROVIDER != "deepseek" else os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
     resp = client.chat.completions.create(
-        model=MODEL,
+        model=model_name,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user}
+        ]
+    )
+    return resp.choices[0].message.content.strip()
+
+def analyze_fulltext(title: str, text: str) -> str:
+    ensure_client()
+    if not text:
+        return "（无可用全文）"
+    trimmed = text[:ANALYSIS_MAX_CHARS]
+    sys = "你是资深学术助理，请基于提供的论文全文文本，用中文简洁、有条理地作答。"
+    user = f"""
+请基于下方全文内容，分别用条理清晰的短段落（限制字数）回答三个问题：
+1) 研究背景与既有方法的问题（≤200字）。
+2) 论文核心方法如何解决上述问题（≤600字）。
+3) 在哪些任务上取得了怎样的效果（≤200字）。
+注意：
+- 用1/2/3分条输出, 在每个问题中可以使用 - 等列表符号梳理说明；
+- 不要复述题目；
+- 使用markdown格式输出。
+
+【标题】{title}
+【正文】
+{trimmed}
+"""
+    model_name = (ANALYSIS_MODEL or MODEL)
+    if LLM_PROVIDER == "deepseek":
+        model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+    resp = client.chat.completions.create(
+        model=model_name,
         temperature=0.2,
         messages=[
             {"role": "system", "content": sys},
@@ -172,12 +252,30 @@ def write_daily_post(date_str: str, items: list, total_entries: int, window_star
         lines.append(f"- **PDF**: [{it['pdf']}]({it['pdf']})")
         lines.append("")
         lines.append(it["summary_md"])  # 中文译文/要点
+        # 折叠的“详细解读”
+        if it.get("analysis_md"):
+            lines.append("")
+            lines.append("<details>")
+            lines.append("<summary>详细解读</summary>")
+            lines.append("")
+            lines.append("<div markdown=\"1\">")
+            lines.append(it["analysis_md"])  # 模型输出的三问三答（渲染为 Markdown）
+            lines.append("</div>")
+            lines.append("")
+            lines.append("</details>")
         lines.append("\n---\n")
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"Wrote {out_path}")
     return out_path
+
+def cleanup_pdfs_folder():
+    try:
+        if os.path.isdir(PDF_DIR):
+            shutil.rmtree(PDF_DIR)
+    except Exception as ex:
+        print(f"Cleanup PDFs failed: {ex}")
 
 def main() -> None:
     seen = set() if RESET_SEEN else load_seen_ids()
@@ -197,7 +295,7 @@ def main() -> None:
         for e in entries:
             link = getattr(e, "link", "")
             aid = arxiv_id_from_link(link)
-            title = getattr(e, "title", "").strip()
+            title = normalize_whitespace(getattr(e, "title", ""))
             cats = extract_categories(e)
             primary = get_primary_category(e)
             by_tags = any(cat in allowed for cat in cats)
@@ -218,60 +316,79 @@ def main() -> None:
 
     items = []
     count = 0
-    for e in entries:
-        link = getattr(e, "link", "")
-        aid = arxiv_id_from_link(link)
-        if aid in seen:
-            continue
-        title = e.title.strip()
-        # authors
-        authors = [a.name for a in getattr(e, "authors", [])] or []
-        # categories（更稳健提取）
-        cats = extract_categories(e)
-        # 仅保留 cs.SD / eess.AS（主分类可选严格）
-        primary = get_primary_category(e)
-        allowed_by_tags = any(cat in allowed for cat in cats)
-        allowed_by_primary = (primary in allowed) if STRICT_PRIMARY_ONLY else allowed_by_tags
-        if not allowed_by_primary:
-            print(f"Not allowed by primary: {aid} | primary={primary} | cats={cats} | by_tags={allowed_by_tags} by_primary={allowed_by_primary}")
-            continue
-
-
-        # abstract
-        abstract = getattr(e, "summary", "").strip()
-        # pdf link
-        pdf = ""
-        for l in getattr(e, "links", []):
-            if l.get("type") == "application/pdf":
-                pdf = l.get("href")
-                break
-        pdf = pdf or (link.replace("/abs/", "/pdf/") + ".pdf")
-
-        if DRY_RUN:
-            # 调试模式下不调用 OpenAI，直接记录占位文本
-            md = "（调试）仅打印分类，不进行翻译。"
-        else:
-            # 调用 OpenAI 翻译（不读取 PDF）
-            try:
-                md = translate_abstract_to_zh(title, authors, abstract, cats, link, pdf)
-            except Exception as ex:
-                print(f"OpenAI translate failed for {aid}: {ex}")
+    try:
+        for e in entries:
+            link = getattr(e, "link", "")
+            aid = arxiv_id_from_link(link)
+            if aid in seen:
+                continue
+            title = normalize_whitespace(e.title)
+            # authors
+            authors = [a.name for a in getattr(e, "authors", [])] or []
+            # categories（更稳健提取）
+            cats = extract_categories(e)
+            # 仅保留 cs.SD / eess.AS（主分类可选严格）
+            primary = get_primary_category(e)
+            allowed_by_tags = any(cat in allowed for cat in cats)
+            allowed_by_primary = (primary in allowed) if STRICT_PRIMARY_ONLY else allowed_by_tags
+            if not allowed_by_primary:
+                print(f"Not allowed by primary: {aid} | primary={primary} | cats={cats} | by_tags={allowed_by_tags} by_primary={allowed_by_primary}")
                 continue
 
-        items.append({
-            "id": aid,
-            "title": title,
-            "authors": authors,
-            "categories": cats,
-            "link": link,
-            "pdf": pdf,
-            "summary_md": md
-        })
-        seen.add(aid)
-        count += 1
-        if count >= MAX_PAPERS:
-            break
-        time.sleep(0.8)  # 轻微节流
+            # abstract
+            abstract = getattr(e, "summary", "").strip()
+            # pdf link
+            pdf = ""
+            for l in getattr(e, "links", []):
+                if l.get("type") == "application/pdf":
+                    pdf = l.get("href")
+                    break
+            pdf = pdf or (link.replace("/abs/", "/pdf/") + ".pdf")
+
+            if DRY_RUN:
+                # 调试模式下不调用 LLM，直接记录占位文本
+                md = "（调试）仅打印分类，不进行翻译。"
+                analysis_md = "（调试）未进行全文解读。"
+            else:
+                # 调用 LLM 翻译（不读取 PDF）
+                try:
+                    md = translate_abstract_to_zh(title, authors, abstract, cats, link, pdf)
+                except Exception as ex:
+                    print(f"OpenAI translate failed for {aid}: {ex}")
+                    continue
+                # 下载 PDF 并做全文解读（独立对话）
+                analysis_md = ""
+                try:
+                    os.makedirs(PDF_DIR, exist_ok=True)
+                    pdf_local_path = os.path.join(PDF_DIR, f"{aid}.pdf")
+                    if not os.path.exists(pdf_local_path):
+                        r = requests.get(pdf, timeout=60)
+                        r.raise_for_status()
+                        with open(pdf_local_path, "wb") as pf:
+                            pf.write(r.content)
+                    full_text = extract_text_pymupdf(pdf_local_path)
+                    analysis_md = analyze_fulltext(title, full_text)
+                except Exception as ex:
+                    analysis_md = f"（全文解读失败：{ex}）"
+
+            items.append({
+                "id": aid,
+                "title": title,
+                "authors": authors,
+                "categories": cats,
+                "link": link,
+                "pdf": pdf,
+                "summary_md": md,
+                "analysis_md": analysis_md
+            })
+            seen.add(aid)
+            count += 1
+            if count >= MAX_PAPERS:
+                break
+            time.sleep(0.8)  # 轻微节流
+    finally:
+        # 无论成功失败，都清理 PDF 目录
+        cleanup_pdfs_folder()
 
     save_seen_ids(seen)
 

@@ -76,3 +76,15 @@ git push --force-with-lease origin main
   - `DEBUG_LIST_CATEGORIES=1` 仅打印 `aid/primary/cats/title` 与过滤结果，不翻译；
   - `DRY_RUN=1` 正常生成但不调用 OpenAI（写入占位文本）；
   - `RESET_SEEN=1` 忽略已见 ID 去重，便于复跑。
+
+## DeepSeek 与全文解读
+
+- 切换到 DeepSeek：
+  ```bash
+  export LLM_PROVIDER=deepseek
+  export DEEPSEEK_API_KEY=你的Key
+  # 可选：export DEEPSEEK_BASE_URL=https://api.deepseek.com/beta
+  # 可选：export DEEPSEEK_MODEL=deepseek-chat
+  ```
+- 全文解读：脚本会下载 PDF（保存到 `data/pdfs`）、用 PyMuPDF 抽取正文，
+  并在每篇摘要下方生成一个“详细解读”折叠块（点击展开）。
