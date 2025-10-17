@@ -40,6 +40,12 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek").lower()
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/beta")
 
+# arXiv 查询分页/排序/过滤（可通过环境变量覆写）
+ARXIV_PAGE_SIZE = int(os.environ.get("ARXIV_PAGE_SIZE", "100"))
+ARXIV_MAX_PAGES = int(os.environ.get("ARXIV_MAX_PAGES", "5"))
+ARXIV_SORT_BY = os.environ.get("ARXIV_SORT_BY", "lastUpdatedDate")  # submittedDate | lastUpdatedDate
+ARXIV_FILTER_BY = os.environ.get("ARXIV_FILTER_BY", "published").lower()  # published | updated | updated_or_published
+
 
 def extract_text_pymupdf(pdf_path):
     doc = fitz.open(pdf_path)
@@ -58,14 +64,16 @@ def extract_text_pymupdf(pdf_path):
 
 
 # arXiv API：按提交时间倒序
-def build_arxiv_query(categories: str) -> str:
+def build_arxiv_query(categories: str, start: int = 0) -> str:
     cats = [c.strip() for c in categories.split(",") if c.strip()]
     query = " OR ".join([f"cat:{c}" for c in cats])
+    query = f"({query})"  # 显式括号防止解析歧义
     params = {
         "search_query": query,
-        "sortBy": "submittedDate",
+        "sortBy": ARXIV_SORT_BY,
         "sortOrder": "descending",
-        "max_results": 100,
+        "start": start,
+        "max_results": ARXIV_PAGE_SIZE,
     }
     return "http://export.arxiv.org/api/query?" + urlencode(params, quote_via=quote_plus)
 
@@ -102,23 +110,49 @@ def compute_anchored_window():
     return start_utc, end_utc, start_cst, end_cst
 
 def fetch_recent_entries():
-    url = build_arxiv_query(CATEGORIES)
-    feed = feedparser.parse(url)
-    if feed.bozo:
-        raise RuntimeError(f"Feed parse error: {feed.bozo_exception}")
     window_start_utc, window_end_utc, window_start_cst, window_end_cst = compute_anchored_window()
     entries = []
-    for e in feed.entries:
-        # 优先基于 published 过滤；缺失时退回 updated
-        ts_raw = getattr(e, "published", getattr(e, "updated", ""))
-        if not ts_raw:
-            continue
-        ts = dtparser.parse(ts_raw)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        # 使用 [start, end) 半开区间，避免与隔天窗口重叠
-        if window_start_utc <= ts < window_end_utc:
-            entries.append(e)
+    start = 0
+    stop = False
+    request_headers = {"User-Agent": "arxiv-speech-daily-bot (+https://github.com/)"}
+    for _ in range(ARXIV_MAX_PAGES):
+        url = build_arxiv_query(CATEGORIES, start=start)
+        feed = feedparser.parse(url, request_headers=request_headers)
+        if feed.bozo:
+            raise RuntimeError(f"Feed parse error: {feed.bozo_exception}")
+        if not feed.entries:
+            break
+        for e in feed.entries:
+            pub_raw = getattr(e, "published", "")
+            upd_raw = getattr(e, "updated", "")
+            # 过滤用时间戳
+            if ARXIV_FILTER_BY == "updated":
+                filt_raw = upd_raw or pub_raw
+            elif ARXIV_FILTER_BY == "updated_or_published":
+                filt_raw = upd_raw or pub_raw
+            else:
+                filt_raw = pub_raw or upd_raw
+            if not filt_raw:
+                continue
+            ts = dtparser.parse(filt_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            # 按排序字段决定是否提前停止翻页
+            sort_raw = upd_raw if ARXIV_SORT_BY == "lastUpdatedDate" else pub_raw
+            if sort_raw:
+                sort_ts = dtparser.parse(sort_raw)
+                if sort_ts.tzinfo is None:
+                    sort_ts = sort_ts.replace(tzinfo=timezone.utc)
+                if sort_ts < window_start_utc:
+                    stop = True
+                    break
+            if window_start_utc <= ts < window_end_utc:
+                entries.append(e)
+        if stop:
+            break
+        if len(feed.entries) < ARXIV_PAGE_SIZE:
+            break
+        start += ARXIV_PAGE_SIZE
     return entries, window_start_cst, window_end_cst
 
 def extract_categories(e) -> list:
